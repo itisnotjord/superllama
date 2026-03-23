@@ -152,11 +152,15 @@ def compute_max_context(config):
 
 def compute_max_context_for_model(size, ram_gb):
     model = MODELS[size]
-    headroom = ram_gb - model["size_gb"] - 4
+    # Reserve: model weight + 4GB OS headroom + compute buffers (~1-2GB)
+    headroom = ram_gb - model["size_gb"] - 5
     if headroom <= 0:
         return 4096
-    ctx = int(headroom * 8192 / 0.5)
-    return min(ctx, 65536)
+    # KV cache is roughly 0.5-1.0 GB per 8K tokens depending on model size
+    # Be conservative: assume ~1GB per 8K tokens for safety
+    ctx = int(headroom * 8192)
+    # Clamp to reasonable range
+    return max(4096, min(ctx, 65536))
 
 # ---------------------------------------------------------------------------
 # Binary helpers
@@ -329,7 +333,7 @@ def wait_for_server(config, timeout=300):
     sys.exit(1)
 
 
-def start_server(config, ctx_override=None):
+def start_server(config, ctx_override=None, extra_flags=None):
     """Start llama-server as a background process."""
     llama = find_llama_server()
     if not llama:
@@ -352,7 +356,7 @@ def start_server(config, ctx_override=None):
         "-ub", "512",
         "--host", config["host"],
         "--port", str(config["port"]),
-    ]
+    ] + (extra_flags or [])
 
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     log = open(LOG_FILE, "w")
@@ -484,14 +488,16 @@ def cmd_code(config, extra):
 
     # Start server in background if not already running
     model = MODELS[config["model_size"]]
+    code_ctx = compute_max_context(config)
+
     if not server_health(config):
-        code_ctx = compute_max_context(config)
         print(f"Model:   {model['repo']}:{model['quant']}")
         print(f"Context: {code_ctx} tokens")
         print(f"Server:  http://{config['host']}:{config['port']}")
         print()
         print("Starting llama-server (first run downloads the model, may take a few minutes)...")
-        start_server(config, ctx_override=code_ctx)
+        # Use KV cache quantization to fit more context in limited RAM
+        start_server(config, ctx_override=code_ctx, extra_flags=["-ctk", "q8_0", "-ctv", "q8_0"])
         wait_for_server(config, timeout=600)  # 10 min for large model downloads
     else:
         print(f"Server already running on http://{config['host']}:{config['port']}")
@@ -506,14 +512,17 @@ def cmd_code(config, extra):
         "ANTHROPIC_DEFAULT_SONNET_MODEL": model_name,
         "ANTHROPIC_DEFAULT_HAIKU_MODEL": model_name,
         "CLAUDE_CODE_SUBAGENT_MODEL": model_name,
-        "CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(config["ctx_size"]),
+        # Tell Claude Code our ACTUAL context size so it compacts at the right time
+        "CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(code_ctx),
         "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
         "DISABLE_PROMPT_CACHING": "1",
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+        # Minimal system prompt + fewer tools — saves ~10K tokens of context
+        "CLAUDE_CODE_SIMPLE": "1",
     })
 
     cmd = [claude_path, "--model", model_name] + extra
-    print(f"Launching Claude Code with local {model_name}...")
+    print(f"Launching Claude Code with local {model_name} (simple mode)...")
 
     if platform.system() == "Windows":
         proc = subprocess.run(cmd, env=env)
