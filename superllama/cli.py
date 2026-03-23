@@ -152,15 +152,22 @@ def compute_max_context(config):
 
 def compute_max_context_for_model(size, ram_gb):
     model = MODELS[size]
-    # Reserve: model weight + 4GB OS headroom + compute buffers (~1-2GB)
+    # Reserve: model weight + 5GB OS/compute headroom
     headroom = ram_gb - model["size_gb"] - 5
     if headroom <= 0:
         return 4096
-    # KV cache is roughly 0.5-1.0 GB per 8K tokens depending on model size
-    # Be conservative: assume ~1GB per 8K tokens for safety
+    # KV cache: ~1GB per 8K tokens (conservative estimate)
     ctx = int(headroom * 8192)
-    # Clamp to reasonable range
-    return max(4096, min(ctx, 65536))
+    # Cap based on RAM tier — bigger context = slower prompt processing
+    # 16GB Mac: 8-16K is the sweet spot for responsiveness
+    # 32GB+: can afford 32-64K
+    if ram_gb <= 18:
+        cap = 16384
+    elif ram_gb <= 36:
+        cap = 32768
+    else:
+        cap = 65536
+    return max(4096, min(ctx, cap))
 
 # ---------------------------------------------------------------------------
 # Binary helpers
@@ -531,6 +538,72 @@ def cmd_code(config, extra):
         os.execvpe(claude_path, cmd, env)
 
 
+def _write_aider_model_settings(config):
+    """Write optimized Aider model settings for local Qwen 3.5."""
+    model = MODELS[config["model_size"]]
+    # Use 'whole' edit format for smaller models, 'diff' for 27B+
+    edit_fmt = "diff" if model["size_gb"] >= 16 else "whole"
+    settings_path = CONFIG_DIR / "aider.model.settings.yml"
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(
+        f"- name: openai/qwen3.5\n"
+        f"  edit_format: {edit_fmt}\n"
+        f"  use_repo_map: false\n"
+        f"  streaming: true\n"
+        f"  use_temperature: true\n"
+        f"  extra_params:\n"
+        f"    max_tokens: 4096\n"
+    )
+    return str(settings_path), edit_fmt
+
+
+def cmd_aider(config, extra):
+    aider_path = shutil.which("aider")
+    if not aider_path:
+        print("Aider not found.")
+        print("Install it with:  pip install aider-chat")
+        sys.exit(1)
+
+    # Start server in background if not running
+    if not server_health(config):
+        model = MODELS[config["model_size"]]
+        ctx = config["ctx_size"]
+        print(f"Model:   {model['repo']}:{model['quant']}")
+        print(f"Context: {ctx} tokens")
+        print(f"Server:  http://{config['host']}:{config['port']}")
+        print()
+        print("Starting llama-server (first run downloads the model, may take a few minutes)...")
+        start_server(config)
+        wait_for_server(config, timeout=600)
+    else:
+        print(f"Server already running on http://{config['host']}:{config['port']}")
+
+    # Write optimized model settings
+    settings_path, edit_fmt = _write_aider_model_settings(config)
+
+    env = os.environ.copy()
+    env["OPENAI_API_BASE"] = f"http://{config['host']}:{config['port']}/v1"
+    env["OPENAI_API_KEY"] = "superllama"
+
+    cmd = [
+        aider_path,
+        "--model", "openai/qwen3.5",
+        "--model-settings-file", settings_path,
+        "--no-show-model-warnings",
+        "--no-auto-lint",
+        "--no-auto-test",
+    ] + extra
+
+    print(f"Launching Aider (edit format: {edit_fmt})...")
+    print()
+
+    if platform.system() == "Windows":
+        proc = subprocess.run(cmd, env=env)
+        sys.exit(proc.returncode)
+    else:
+        os.execvpe(aider_path, cmd, env)
+
+
 def cmd_bench(config):
     bench = find_binary("llama-bench")
     if not bench:
@@ -704,6 +777,7 @@ def main():
     subparsers.add_parser("serve", help="Start API server + web UI")
     subparsers.add_parser("chat", help="Interactive terminal chat")
     subparsers.add_parser("code", help="Launch Claude Code with local Qwen 3.5")
+    subparsers.add_parser("aider", help="Launch Aider coding agent (recommended for local models)")
     subparsers.add_parser("bench", help="Benchmark your setup (tok/s)")
     subparsers.add_parser("setup", help="Interactive first-time setup")
     subparsers.add_parser("stop", help="Stop the running server")
@@ -736,6 +810,8 @@ def main():
         cmd_chat(config, extra)
     elif args.command == "code":
         cmd_code(config, extra)
+    elif args.command == "aider":
+        cmd_aider(config, extra)
     elif args.command == "bench":
         cmd_bench(config)
     elif args.command == "setup":
